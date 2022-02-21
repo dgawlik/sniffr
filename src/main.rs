@@ -4,8 +4,15 @@ use std::convert::TryFrom;
 #[derive(Clone)]
 struct Ethernet2Frame<'a>(&'a [u8]);
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct IpPacket<'a>(&'a [u8], String);
+
+#[derive(Clone)]
+struct TcpSegment<'a>(&'a [u8]);
+
+#[derive(Clone)]
+struct UdpPacket<'a>(&'a [u8]);
+
 
 trait Addressable {
     fn source_address(&self) -> String;
@@ -53,8 +60,7 @@ impl<'a> TryFrom<Ethernet2Frame<'a>> for IpPacket<'a> {
 
     fn try_from(value: Ethernet2Frame<'a>) -> Result<Self, Self::Error> {
         let ethertype = &value.0[12..14];
-        println!("{:?}", hex::encode(ethertype));
-
+     
         if hex::encode(ethertype) == "0800" {
             Ok(IpPacket(value.payload(), String::from("IPv4")))
         } else if hex::encode(ethertype) == "86dd" {
@@ -90,28 +96,98 @@ impl<'a> Addressable for IpPacket<'a> {
 impl<'a> HasPayload<'a> for IpPacket<'a> {
     fn payload(&self) -> &'a [u8] {
         if self.1 == "IPv4" {
-            &self.0[24..]
+            &self.0[20..]
         } else if self.1 == "IPv6" {
-            let mut offset = 40;
-            let mut payload_length: usize = self.0[4] as usize;
-            payload_length = payload_length << 8 + self.0[5];
-
-            let extensions = [0, 43, 44, 50, 51, 60, 135, 139, 140, 253, 254];
-
-            let mut it = self.0[4];
-
-            while !extensions.contains(&(it as i32)) {
-                it = self.0[offset];
-                offset += 16;
-                payload_length -= 16;
-            }
-
-            &self.0[offset..offset + payload_length]
+            &self.0[40..]
         } else {
             panic!();
         }
     }
 }
+
+impl<'a> TryFrom<IpPacket<'a>> for UdpPacket<'a> {
+    type Error = &'static str;
+
+    fn try_from(value: IpPacket<'a>) -> Result<Self, Self::Error> {
+        if value.1 == "IPv4" {
+            if value.0[9] == 17 {
+                Ok(UdpPacket(value.payload()))
+            }
+            else {
+                Err("Not UDP protocol")
+            }
+        }
+        else if value.1 == "IPv6" {
+
+            if value.0[6] != 17 {
+                Err("Not UDP protocol")
+            }
+            else {
+                Ok(UdpPacket(value.payload()))
+            }
+        }
+        else {
+            panic!();
+        }
+    }
+}
+
+impl<'a> TryFrom<IpPacket<'a>> for TcpSegment<'a> {
+    type Error = &'static str;
+
+    fn try_from(value: IpPacket<'a>) -> Result<Self, Self::Error> {
+        if value.1 == "IPv4" {
+            if value.0[9] == 6 {
+                Ok(TcpSegment(value.payload()))
+            }
+            else {
+                Err("Not TCP protocol")
+            }
+        }
+        else if value.1 == "IPv6" {
+            if value.0[6] != 6 {
+                Err("Not TCP protocol")
+            }
+            else {
+                Ok(TcpSegment(value.payload()))
+            }
+        }
+        else {
+            panic!();
+        }
+    }
+}
+
+
+impl<'a> Addressable for UdpPacket<'a> {
+    fn source_address(&self) -> String {
+        let mut addr = (self.0[0] as u16) << 8;
+        addr += self.0[1] as u16;
+        format!("{}", addr)
+    }
+
+    fn destination_address(&self) -> String {
+        let mut addr = (self.0[2] as u16) << 8;
+        addr += self.0[3] as u16;
+        format!("{}", addr)
+    }
+}
+
+
+impl<'a> Addressable for TcpSegment<'a> {
+    fn source_address(&self) -> String {
+        let mut addr = (self.0[0] as u16) << 8;
+        addr += self.0[1] as u16;
+        format!("{}", addr)
+    }
+
+    fn destination_address(&self) -> String {
+        let mut addr = (self.0[2] as u16) << 8;
+        addr += self.0[3] as u16;
+        format!("{}", addr)
+    }
+}
+
 
 fn main() {
     let device = Device::lookup().unwrap();
@@ -148,7 +224,23 @@ fn main() {
 
                 root.insert(String::from("ip"), ip_packet);
 
-                
+                if let Ok(udp) = UdpPacket::try_from(ip2.clone()) {
+                    let udp_packet = serde_json::json!({
+                        "source": udp.source_address(),
+                        "destination": udp.destination_address(),
+                    });
+
+                    root.insert(String::from("udp"), udp_packet);
+                }
+
+                if let Ok(tcp) = TcpSegment::try_from(ip2) {
+                    let tcp_segment = serde_json::json!({
+                        "source": tcp.source_address(),
+                        "destination": tcp.destination_address(),
+                    });
+
+                    root.insert(String::from("tcp"), tcp_segment);
+                }
             }
 
             let mut s = String::from("");
