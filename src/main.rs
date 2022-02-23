@@ -1,26 +1,22 @@
 use pcap::{Capture, Device};
 use std::convert::TryFrom;
+use jsonpath_rust::{JsonPathFinder,JsonPathQuery,JsonPathInst};
+use clap::Parser;
 
-#[derive(Clone)]
-struct Ethernet2Frame<'a>(&'a [u8]);
-
-#[derive(Clone)]
-struct IpPacket<'a>(&'a [u8], String);
-
-#[derive(Clone)]
-struct TcpSegment<'a>(&'a [u8]);
-
-#[derive(Clone)]
-struct UdpPacket<'a>(&'a [u8]);
-
-
-trait Addressable {
-    fn source_address(&self) -> String;
-    fn destination_address(&self) -> String;
+#[derive(Parser, Debug)]
+#[clap(author="Dominik Gawlik", version="0", about="Sniffr", long_about = "Simple sniffer in Rust")]
+struct Args {
+    /// Name of the person to greet
+    #[clap(short='q', long="jpath-query", default_value_t=String::from(""))]
+    query: String,
 }
 
-trait HasPayload<'a> {
-    fn payload(&self) -> &'a [u8];
+enum Record<'a> {
+    Ethernet2Frame(&'a [u8]),
+    Ip4Packet(&'a [u8]),
+    Ip6Packet(&'a [u8]),
+    TcpSegment(&'a [u8]),
+    UdpPacket(&'a [u8]),
 }
 
 fn print_dot(data: &[u8]) -> String {
@@ -39,152 +35,113 @@ fn print_hex(data: &[u8]) -> String {
         .unwrap()
 }
 
-impl<'a> Addressable for Ethernet2Frame<'a> {
-    fn source_address(&self) -> String {
-        print_hex(&self.0[..6])
-    }
-
-    fn destination_address(&self) -> String {
-        print_hex(&self.0[6..12])
-    }
-}
-
-impl<'a> HasPayload<'a> for Ethernet2Frame<'a> {
-    fn payload(&self) -> &'a [u8] {
-        &self.0[14..self.0.len() - 4]
-    }
-}
-
-impl<'a> TryFrom<Ethernet2Frame<'a>> for IpPacket<'a> {
-    type Error = &'static str;
-
-    fn try_from(value: Ethernet2Frame<'a>) -> Result<Self, Self::Error> {
-        let ethertype = &value.0[12..14];
-     
-        if hex::encode(ethertype) == "0800" {
-            Ok(IpPacket(value.payload(), String::from("IPv4")))
-        } else if hex::encode(ethertype) == "86dd" {
-            Ok(IpPacket(value.payload(), String::from("IPv6")))
-        } else {
-            Err("Not an IP protocol.")
+fn source_address(rec: &Record) -> String {
+    match rec {
+        Record::Ethernet2Frame(b) => print_hex(&b[..6]),
+        Record::Ip4Packet(b) => print_dot(&b[12..16]),
+        Record::Ip6Packet(b) => print_hex(&b[8..24]),
+        Record::TcpSegment(b) => {
+            let mut addr = (b[0] as u16) << 8;
+            addr += b[1] as u16;
+            format!("{}", addr)
+        }
+        Record::UdpPacket(b) => {
+            let mut addr = (b[0] as u16) << 8;
+            addr += b[1] as u16;
+            format!("{}", addr)
         }
     }
 }
 
-impl<'a> Addressable for IpPacket<'a> {
-    fn source_address(&self) -> String {
-        if self.1 == "IPv4" {
-            print_dot(&self.0[12..16])
-        } else if self.1 == "IPv6" {
-            print_hex(&self.0[8..24])
-        } else {
-            panic!();
+fn destination_address(rec: &Record) -> String{
+    match rec {
+        Record::Ethernet2Frame(b) => print_hex(&b[6..12]),
+        Record::Ip4Packet(b) => print_dot(&b[16..20]),
+        Record::Ip6Packet(b) => print_hex(&b[24..40]),
+        Record::UdpPacket(b) => {
+            let mut addr = (b[2] as u16) << 8;
+            addr += b[3] as u16;
+            format!("{}", addr)
         }
-    }
-
-    fn destination_address(&self) -> String {
-        if self.1 == "IPv4" {
-            print_dot(&self.0[16..20])
-        } else if self.1 == "IPv6" {
-            print_hex(&self.0[24..40])
-        } else {
-            panic!();
+        Record::TcpSegment(b) => {
+            let mut addr = (b[2] as u16) << 8;
+            addr += b[3] as u16;
+            format!("{}", addr)
         }
     }
 }
 
-impl<'a> HasPayload<'a> for IpPacket<'a> {
-    fn payload(&self) -> &'a [u8] {
-        if self.1 == "IPv4" {
-            &self.0[20..]
-        } else if self.1 == "IPv6" {
-            &self.0[40..]
-        } else {
-            panic!();
+fn payload<'a>(rec: &'a Record) -> &'a [u8]{
+    match rec {
+        Record::Ethernet2Frame(b) => &b[14..b.len() - 4],
+        Record::Ip4Packet(b) => &b[20..],
+        Record::Ip6Packet(b) => &b[40..],
+        Record::UdpPacket(b) => &b[8..],
+        Record::TcpSegment(b) => {
+            let hdr_len = (b[12] >> 4) as usize;
+            &b[hdr_len..]
         }
     }
 }
 
-impl<'a> TryFrom<IpPacket<'a>> for UdpPacket<'a> {
-    type Error = &'static str;
+fn name(rec: &Record) -> String {
+    match rec {
+        Record::Ethernet2Frame(b) => String::from("Ethernet2"),
+        Record::Ip4Packet(b) => String::from("IPv4"),
+        Record::Ip6Packet(b) => String::from("IPv6"),
+        Record::UdpPacket(b) => String::from("UDP"),
+        Record::TcpSegment(b) => String::from("TCP")
+    }
+}
 
-    fn try_from(value: IpPacket<'a>) -> Result<Self, Self::Error> {
-        if value.1 == "IPv4" {
-            if value.0[9] == 17 {
-                Ok(UdpPacket(value.payload()))
+fn unwrap<'a>(rec: &'a Record) -> &'a [u8] {
+    match rec {
+        Record::Ethernet2Frame(b) => b,
+        Record::Ip4Packet(b) => b,
+        Record::Ip6Packet(b) => b,
+        Record::UdpPacket(b) => b,
+        Record::TcpSegment(b) => b
+    }
+}
+
+fn decapsulate<'a>(rec: &'a Record) -> Option<Record<'a>> {
+    match rec {
+        eth @ Record::Ethernet2Frame(b)=> {
+            let ethertype = &b[12..14];
+
+            if hex::encode(ethertype) == "0800" {
+                Some(Record::Ip4Packet(payload(eth)))
+            }
+            else if hex::encode(ethertype) == "86dd" {
+                Some(Record::Ip6Packet(payload(eth)))
             }
             else {
-                Err("Not UDP protocol")
+                None
             }
-        }
-        else if value.1 == "IPv6" {
-
-            if value.0[6] != 17 {
-                Err("Not UDP protocol")
+        },
+        ip4 @ Record::Ip4Packet(b) => {
+            if b[9] == 17 {
+                Some(Record::UdpPacket(payload(ip4)))
             }
-            else {
-                Ok(UdpPacket(value.payload()))
-            }
-        }
-        else {
-            panic!();
-        }
-    }
-}
-
-impl<'a> TryFrom<IpPacket<'a>> for TcpSegment<'a> {
-    type Error = &'static str;
-
-    fn try_from(value: IpPacket<'a>) -> Result<Self, Self::Error> {
-        if value.1 == "IPv4" {
-            if value.0[9] == 6 {
-                Ok(TcpSegment(value.payload()))
+            else if b[9] == 6 {
+                Some(Record::TcpSegment(payload(ip4)))
             }
             else {
-                Err("Not TCP protocol")
+                None
             }
-        }
-        else if value.1 == "IPv6" {
-            if value.0[6] != 6 {
-                Err("Not TCP protocol")
+        },
+        ip6 @ Record::Ip6Packet(b) => {
+            if b[6] == 17 {
+                Some(Record::UdpPacket(payload(ip6)))
+            }
+            else if b[6] == 6 {
+                Some(Record::TcpSegment(payload(ip6)))
             }
             else {
-                Ok(TcpSegment(value.payload()))
+                None
             }
-        }
-        else {
-            panic!();
-        }
-    }
-}
-
-
-impl<'a> Addressable for UdpPacket<'a> {
-    fn source_address(&self) -> String {
-        let mut addr = (self.0[0] as u16) << 8;
-        addr += self.0[1] as u16;
-        format!("{}", addr)
-    }
-
-    fn destination_address(&self) -> String {
-        let mut addr = (self.0[2] as u16) << 8;
-        addr += self.0[3] as u16;
-        format!("{}", addr)
-    }
-}
-
-
-impl<'a> Addressable for TcpSegment<'a> {
-    fn source_address(&self) -> String {
-        let mut addr = (self.0[0] as u16) << 8;
-        addr += self.0[1] as u16;
-        format!("{}", addr)
-    }
-
-    fn destination_address(&self) -> String {
-        let mut addr = (self.0[2] as u16) << 8;
-        addr += self.0[3] as u16;
-        format!("{}", addr)
+        },
+        _ => None
     }
 }
 
@@ -200,48 +157,41 @@ fn main() {
         .open()
         .unwrap();
 
+    let args = Args::parse();
+
+
     loop {
         if let Ok(packet) = pcap.next() {
-            let eth = Ethernet2Frame(packet.data);
+            let eth = Record::Ethernet2Frame(packet.data);
 
             let mut root = serde_json::Map::new();
 
             let ethernet = serde_json::json!({
-                "source": eth.source_address(),
-                "destination": eth.destination_address(),
+                "source": source_address(&eth),
+                "destination": destination_address(&eth)
             });
 
-            root.insert(String::from("ethernet"), ethernet);
+            root.insert(name(&eth), ethernet);
 
-            let ip = IpPacket::try_from(eth);
-            
-            if let Ok(ip2) = ip {
+           
+            if let Some(ip) = decapsulate(&eth) {
                 let ip_packet = serde_json::json!({
-                    "source": ip2.source_address(),
-                    "destination": ip2.destination_address(),
-                    "version": ip2.1
+                    "source": source_address(&ip),
+                    "destination": destination_address(&ip),
                 });
 
-                root.insert(String::from("ip"), ip_packet);
+                root.insert(name(&ip), ip_packet);
 
-                if let Ok(udp) = UdpPacket::try_from(ip2.clone()) {
-                    let udp_packet = serde_json::json!({
-                        "source": udp.source_address(),
-                        "destination": udp.destination_address(),
+                if let Some(l4) = decapsulate(&ip){
+                    let l4_packet = serde_json::json!({
+                        "source": source_address(&l4),
+                        "destination": destination_address(&l4),
                     });
 
-                    root.insert(String::from("udp"), udp_packet);
-                }
-
-                if let Ok(tcp) = TcpSegment::try_from(ip2) {
-                    let tcp_segment = serde_json::json!({
-                        "source": tcp.source_address(),
-                        "destination": tcp.destination_address(),
-                    });
-
-                    root.insert(String::from("tcp"), tcp_segment);
+                    root.insert(name(&l4), l4_packet);
                 }
             }
+
 
             let mut s = String::from("");
             for b in packet.data {
@@ -254,10 +204,15 @@ fn main() {
             }
             root.insert(String::from("data"), serde_json::Value::String(s));
 
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::Value::Object(root)).unwrap()
-            )
+            let obj = serde_json::Value::Object(root);
+
+            if let Ok(res) =  &obj.clone().path("$..book[?(@.author size 10)].title") {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&obj).unwrap()
+                )
+            }
+           
         }
     }
 }
