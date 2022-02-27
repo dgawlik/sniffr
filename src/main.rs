@@ -1,13 +1,11 @@
 use pcap::{Capture, Device};
-use std::convert::TryFrom;
-use jsonpath_rust::{JsonPathFinder,JsonPathQuery,JsonPathInst};
+use jsonpath_rust::{JsonPathQuery};
 use clap::Parser;
 
 #[derive(Parser, Debug)]
 #[clap(author="Dominik Gawlik", version="0", about="Sniffr", long_about = "Simple sniffer in Rust")]
 struct Args {
-    /// Name of the person to greet
-    #[clap(short='q', long="jpath-query", default_value_t=String::from(""))]
+    #[clap(short='q', long="jpath-query", default_value_t=String::from("$"))]
     query: String,
 }
 
@@ -206,7 +204,7 @@ fn main() {
 
             let obj = serde_json::Value::Object(root);
 
-            if let Ok(res) =  &obj.clone().path("$..book[?(@.author size 10)].title") {
+            if let Ok(_) =  &obj.clone().path(&args.query.as_str()) {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&obj).unwrap()
